@@ -19,6 +19,9 @@
 #include <bthread/mutex.h>
 #include <butil/time.h> // NOLINT
 
+#include <mutex>
+#include <unordered_set>
+
 #include "agent/agent_server.h"
 #include "common/config.h"
 #include "common/status.h"
@@ -109,7 +112,47 @@ int get_num_vacuum_active_tasks(void*) {
 #endif
 }
 
+// Tablets that have a publish task queued or running on this node. A FE retry for a tablet whose task
+// is still waiting in the queue used to add a second task for the same tablet behind the first one, and
+// both ran the full apply (the second one only to hit the per-tablet lock in lake::publish_version).
+// Rejecting the duplicate at submission keeps the queue at one task per tablet and answers the FE with
+// RESOURCE_BUSY immediately, which it treats as "still in progress" and backs off from.
+class PublishingTablets {
+public:
+    bool try_add(int64_t tablet_id) {
+        std::lock_guard l(_mtx);
+        return _tablets.insert(tablet_id).second;
+    }
+
+    void remove(int64_t tablet_id) {
+        std::lock_guard l(_mtx);
+        _tablets.erase(tablet_id);
+    }
+
+    size_t size() {
+        std::lock_guard l(_mtx);
+        return _tablets.size();
+    }
+
+private:
+    std::mutex _mtx;
+    std::unordered_set<int64_t> _tablets;
+};
+
+PublishingTablets g_publishing_tablets;
+
+size_t get_num_publishing_tablets(void*) {
+    return g_publishing_tablets.size();
+}
+
 bvar::Adder<int64_t> g_publish_version_failed_tasks("lake_publish_version_failed_tasks");
+// Requests turned away because the tablet already had a publish task queued or running here.
+bvar::Adder<int64_t> g_publish_version_duplicate_tablets("lake_publish_version_duplicate_tablets");
+// Tasks that started after their request's deadline and were run anyway
+// (config::lake_publish_version_run_expired_tasks).
+bvar::Adder<int64_t> g_publish_version_expired_tasks_run("lake_publish_version_expired_tasks_run");
+bvar::PassiveStatus<size_t> g_publish_version_publishing_tablets("lake_publish_version_publishing_tablets",
+                                                                 get_num_publishing_tablets, nullptr);
 bvar::LatencyRecorder g_publish_tablet_version_latency("lake_publish_tablet_version");
 bvar::LatencyRecorder g_publish_tablet_version_queuing_latency("lake_publish_tablet_version_queuing");
 bvar::PassiveStatus<int> g_publish_version_queued_tasks("lake_publish_version_queued_tasks",
@@ -190,9 +233,23 @@ void LakeServiceImpl::publish_version(::google::protobuf::RpcController* control
         rebuild_pindex_tablets.insert(id);
     }
     for (auto tablet_id : request->tablet_ids()) {
+        if (!g_publishing_tablets.try_add(tablet_id)) {
+            g_publish_version_duplicate_tablets << 1;
+            auto st = Status::ResourceBusy(
+                    fmt::format("publish of tablet {} is already queued or running on this node", tablet_id));
+            VLOG(2) << st << " txn_ids=" << get_txn_ids_string(request) << " version=" << request->new_version();
+            std::lock_guard l(response_mtx);
+            response->add_failed_tablets(tablet_id);
+            st.to_protobuf(response->mutable_status());
+            latch.count_down();
+            continue;
+        }
         auto task = std::make_shared<CancellableRunnable>(
                 [&, tablet_id] {
-                    DeferOp defer([&] { latch.count_down(); });
+                    DeferOp defer([&] {
+                        g_publishing_tablets.remove(tablet_id);
+                        latch.count_down();
+                    });
                     scoped_refptr<Trace> child_trace(new Trace);
                     Trace* sub_trace = child_trace.get();
                     trace->AddChildTrace("PublishTablet", sub_trace);
@@ -234,7 +291,20 @@ void LakeServiceImpl::publish_version(::google::protobuf::RpcController* control
                     TRACE_COUNTER_INCREMENT("queuing_latency_us", queuing_latency);
 
                     StatusOr<TabletMetadataPtr> res;
-                    if (std::chrono::system_clock::now() < timeout_deadline) {
+                    int64_t now_ms = MilliSecondsSinceEpochFromTimePoint(std::chrono::system_clock::now());
+                    TEST_SYNC_POINT_CALLBACK("LakeServiceImpl::publish_version:check_deadline", &now_ms);
+                    bool expired = now_ms >= (int64_t)MilliSecondsSinceEpochFromTimePoint(timeout_deadline);
+                    if (!expired || config::lake_publish_version_run_expired_tasks) {
+                        if (expired) {
+                            // The FE has stopped waiting for this RPC. Finish the tablet anyway: its new
+                            // version lands on storage and in the metacache, so the FE's retry returns at
+                            // once instead of queueing the same work again behind everything else.
+                            g_publish_version_expired_tasks_run << 1;
+                            LOG(INFO) << "Publish task started after its deadline, running it anyway. tablet_id="
+                                      << tablet_id << " txn_ids=" << get_txn_ids_string(request)
+                                      << " queued=" << queuing_latency / 1000 << "ms timeout=" << timeout_ms << "ms";
+                        }
+                        TEST_SYNC_POINT_CALLBACK("LakeServiceImpl::publish_version:before_publish", &tablet_id);
                         res = lake::publish_version(_tablet_mgr, tablet_id, base_version, new_version, txns);
                     } else {
                         auto t = MilliSecondsSinceEpochFromTimePoint(timeout_deadline);
@@ -274,6 +344,7 @@ void LakeServiceImpl::publish_version(::google::protobuf::RpcController* control
                     Status st = Status::Cancelled(
                             fmt::format("publish version task has been cancelled, tablet_id={}", tablet_id));
                     LOG(WARNING) << st;
+                    g_publishing_tablets.remove(tablet_id);
                     std::lock_guard l(response_mtx);
                     response->add_failed_tablets(tablet_id);
                     if (response->status().status_code() == 0) {
@@ -284,6 +355,7 @@ void LakeServiceImpl::publish_version(::google::protobuf::RpcController* control
 
         auto st = thread_pool_token.submit(std::move(task), timeout_deadline);
         if (!st.ok()) {
+            g_publishing_tablets.remove(tablet_id);
             g_publish_version_failed_tasks << 1;
             LOG(WARNING) << "Fail to submit publish version task: " << st << ". tablet_id=" << tablet_id
                          << " txn_ids=" << get_txn_ids_string(request);

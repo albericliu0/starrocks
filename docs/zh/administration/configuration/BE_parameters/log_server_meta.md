@@ -46,6 +46,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 描述：DiagnoseDaemon 处理 `STACK_TRACE` 请求时，两次堆栈诊断的最小时间间隔。若距离上次采集不足该间隔则跳过，以减少频繁堆栈抓取的 CPU 和日志开销；排查瞬时问题可适当调小。
 - 引入版本：v3.5.0
 
+### lake_publish_version_run_expired_tasks
+
+- 默认值：true
+- 类型：Boolean
+- 单位：-
+- 是否动态：是
+- 描述：存算分离集群中，publish 任务从线程池被取出时若已超过请求的超时时间（FE 传入的 `timeout_ms`，即 `lake_publish_version_timeout_ms`），是否仍然执行。此时 FE 已放弃该 RPC 并会重试，而重试只有在该 tablet 的新版本已经写出时才能立即返回。设为 `false` 时此类任务以 `TIMEOUT` 直接丢弃（引入本参数之前的行为），任务在队列里等待的时间被浪费，且每次重试都会让该 tablet 重新排到队尾。
+- 引入版本：v3.5.22
+
 ### load_rpc_slow_log_frequency_threshold_seconds
 
 - 默认值：60

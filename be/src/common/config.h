@@ -1194,6 +1194,12 @@ CONF_mInt64(experimental_lake_wait_per_delete_ms, "0");
 CONF_mBool(experimental_lake_ignore_pk_consistency_check, "false");
 CONF_mInt64(lake_publish_version_slow_log_ms, "1000");
 CONF_mBool(lake_enable_publish_version_trace_log, "false");
+// A publish task that is picked up from the queue only after its request's deadline has passed
+// used to be dropped with TIMEOUT. The FE has already given up on that RPC and will retry, and the
+// retry only returns at once if the tablet's new version has been written by then; dropping the task
+// wasted its queue slot and put the tablet at the back of the queue again on every retry. Run the
+// task anyway. Set to false to restore the old behaviour.
+CONF_mBool(lake_publish_version_run_expired_tasks, "true");
 CONF_mString(lake_vacuum_retry_pattern, "*request rate*");
 CONF_mInt64(lake_vacuum_retry_max_attempts, "5");
 CONF_mInt64(lake_vacuum_retry_min_delay_ms, "100");

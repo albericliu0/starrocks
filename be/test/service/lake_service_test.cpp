@@ -17,6 +17,10 @@
 #include <brpc/controller.h>
 #include <gtest/gtest.h>
 
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+
 #include "column/chunk.h"
 #include "column/fixed_length_column.h"
 #include "common/config.h"
@@ -177,6 +181,118 @@ TEST_F(LakeServiceTest, test_publish_version_thread_pool_full) {
     ASSERT_FALSE(cntl.Failed()) << cntl.ErrorText();
     ASSERT_EQ(1, response.failed_tablets_size());
     ASSERT_EQ(_tablet_id, response.failed_tablets(0));
+}
+
+TEST_F(LakeServiceTest, test_publish_version_duplicate_request_is_busy) {
+    auto log = generate_write_txn_log(1, 10, 1024);
+    ASSERT_OK(_tablet_mgr->put_txn_log(log));
+    PublishVersionRequest request;
+    request.set_base_version(1);
+    request.set_new_version(2);
+    request.add_tablet_ids(_tablet_id);
+    request.add_txn_ids(log.txn_id());
+
+    // Hold the first publish of the tablet inside its task, so a second request for the same tablet
+    // arrives while the first one is still running. Only the first task is held.
+    std::mutex mtx;
+    std::condition_variable cv;
+    bool first_started = false;
+    bool release = false;
+    int blocked = 0;
+    SyncPoint::GetInstance()->SetCallBack("LakeServiceImpl::publish_version:before_publish", [&](void*) {
+        std::unique_lock l(mtx);
+        if (blocked++ > 0) {
+            return;
+        }
+        first_started = true;
+        cv.notify_all();
+        cv.wait(l, [&] { return release; });
+    });
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("LakeServiceImpl::publish_version:before_publish");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+
+    PublishVersionResponse first_response;
+    std::thread first([&] { _lake_service.publish_version(nullptr, &request, &first_response, nullptr); });
+    {
+        std::unique_lock l(mtx);
+        cv.wait(l, [&] { return first_started; });
+    }
+
+    // The duplicate is turned away at submission: never queued, reported as RESOURCE_BUSY so the FE
+    // treats it as "still in progress" and backs off.
+    PublishVersionResponse second_response;
+    _lake_service.publish_version(nullptr, &request, &second_response, nullptr);
+    ASSERT_EQ(1, second_response.failed_tablets_size());
+    ASSERT_EQ(_tablet_id, second_response.failed_tablets(0));
+    ASSERT_EQ(TStatusCode::RESOURCE_BUSY, second_response.status().status_code())
+            << second_response.status().DebugString();
+
+    {
+        std::lock_guard l(mtx);
+        release = true;
+        cv.notify_all();
+    }
+    first.join();
+    ASSERT_EQ(0, first_response.failed_tablets_size()) << first_response.status().DebugString();
+
+    // The registry entry is released with the task: the FE's retry goes through and finds the
+    // version already published.
+    PublishVersionResponse third_response;
+    _lake_service.publish_version(nullptr, &request, &third_response, nullptr);
+    ASSERT_EQ(0, third_response.failed_tablets_size()) << third_response.status().DebugString();
+    ASSERT_OK(_tablet_mgr->get_tablet_metadata(_tablet_id, 2));
+}
+
+TEST_F(LakeServiceTest, test_publish_version_expired_task) {
+    // Every deadline check observes a clock far past the deadline.
+    SyncPoint::GetInstance()->SetCallBack("LakeServiceImpl::publish_version:check_deadline",
+                                          [](void* arg) { *(int64_t*)arg = int64_t{1} << 62; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp defer([]() {
+        SyncPoint::GetInstance()->ClearCallBack("LakeServiceImpl::publish_version:check_deadline");
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+
+    {
+        // Default: the task that started after its deadline still publishes, so the FE's retry finds
+        // the version done instead of queueing the same work again.
+        auto log = generate_write_txn_log(1, 10, 1024);
+        ASSERT_OK(_tablet_mgr->put_txn_log(log));
+        PublishVersionRequest request;
+        request.set_base_version(1);
+        request.set_new_version(2);
+        request.add_tablet_ids(_tablet_id);
+        request.add_txn_ids(log.txn_id());
+        request.set_timeout_ms(60 * 60 * 1000L);
+        PublishVersionResponse response;
+        _lake_service.publish_version(nullptr, &request, &response, nullptr);
+        ASSERT_EQ(0, response.failed_tablets_size()) << response.status().DebugString();
+        ASSERT_OK(_tablet_mgr->get_tablet_metadata(_tablet_id, 2));
+    }
+
+    {
+        // lake_publish_version_run_expired_tasks=false restores the old behaviour: the task is dropped
+        // with TIMEOUT and nothing is written.
+        bool old_value = config::lake_publish_version_run_expired_tasks;
+        config::lake_publish_version_run_expired_tasks = false;
+        DeferOp restore_config([old_value] { config::lake_publish_version_run_expired_tasks = old_value; });
+        auto log = generate_write_txn_log(1, 10, 1024);
+        ASSERT_OK(_tablet_mgr->put_txn_log(log));
+        PublishVersionRequest request;
+        request.set_base_version(2);
+        request.set_new_version(3);
+        request.add_tablet_ids(_tablet_id);
+        request.add_txn_ids(log.txn_id());
+        request.set_timeout_ms(60 * 60 * 1000L);
+        PublishVersionResponse response;
+        _lake_service.publish_version(nullptr, &request, &response, nullptr);
+        ASSERT_EQ(1, response.failed_tablets_size());
+        ASSERT_EQ(TStatusCode::TIMEOUT, response.status().status_code()) << response.status().DebugString();
+        ASSERT_FALSE(_tablet_mgr->get_tablet_metadata(_tablet_id, 3).ok());
+    }
 }
 
 TEST_F(LakeServiceTest, test_publish_version_for_write) {

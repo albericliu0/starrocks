@@ -49,6 +49,15 @@ This topic introduces the following types of BE configurations:
 - Description: Controls the minimum time gap between successive stack-trace diagnostics performed by DiagnoseDaemon for `STACK_TRACE` requests. When a diagnose request arrives, the daemon skips collecting and logging stack traces if the last collection happened less than `diagnose_stack_trace_interval_ms` milliseconds ago. Increase this value to reduce CPU overhead and log volume from frequent stack dumps; decrease it to capture more frequent traces to debug transient issues (for example, in load fail-point simulations of long `TabletsChannel::add_chunk` blocking).
 - Introduced in: v3.5.0
 
+### lake_publish_version_run_expired_tasks
+
+- Default: true
+- Type: Boolean
+- Unit: -
+- Is mutable: Yes
+- Description: Whether a shared-data publish task that is taken from the publish thread pool only after its request's deadline (`timeout_ms` from the FE, `lake_publish_version_timeout_ms`) has passed still runs. The FE has already given up on that RPC and will retry; the retry returns immediately only if the tablet's new version has been written by then. When `false`, such tasks are dropped with `TIMEOUT` (the behavior before this item existed), which wastes the time the task spent in the queue and sends the tablet to the back of the queue on every retry.
+- Introduced in: v3.5.22
+
 ### lake_replication_slow_log_ms
 
 - Default: 30000
