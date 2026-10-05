@@ -752,6 +752,91 @@ TEST_P(LakePartialUpdateTest, test_write_multi_segment) {
     }
 }
 
+// Several column-mode writes published in one batch are applied in one pass: one .cols per source
+// segment for the whole batch, with the last write winning on rows updated more than once, and the
+// same data as applying them one by one.
+TEST_P(LakePartialUpdateTest, test_column_mode_batch_publish_merges_writes) {
+    if (GetParam().partial_update_mode != PartialUpdateMode::COLUMN_UPDATE_MODE) {
+        return;
+    }
+    auto indexes = std::vector<uint32_t>(kChunkSize);
+    for (int i = 0; i < kChunkSize; i++) {
+        indexes[i] = i;
+    }
+    auto version = 1;
+    auto tablet_id = _tablet_metadata->id();
+    const int kSourceSegments = 2;
+    for (int shift = 0; shift < kSourceSegments; shift++) {
+        auto chunk = generate_data(kChunkSize, shift, false, 3);
+        auto txn_id = next_id();
+        ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                                   .set_tablet_manager(_tablet_mgr.get())
+                                                   .set_tablet_id(tablet_id)
+                                                   .set_txn_id(txn_id)
+                                                   .set_partition_id(_partition_id)
+                                                   .set_mem_tracker(_mem_tracker.get())
+                                                   .set_schema_id(_tablet_schema->id())
+                                                   .build());
+        ASSERT_OK(delta_writer->open());
+        ASSERT_OK(delta_writer->write(chunk, indexes.data(), indexes.size()));
+        ASSERT_OK(delta_writer->finish_with_txnlog());
+        delta_writer->close();
+        ASSERT_OK(publish_single_version(tablet_id, version + 1, txn_id).status());
+        version++;
+    }
+
+    auto write_column_update = [&](int update_ratio) {
+        auto txn_id = next_id();
+        auto delta_writer = DeltaWriterBuilder()
+                                    .set_tablet_manager(_tablet_mgr.get())
+                                    .set_tablet_id(tablet_id)
+                                    .set_txn_id(txn_id)
+                                    .set_partition_id(_partition_id)
+                                    .set_mem_tracker(_mem_tracker.get())
+                                    .set_schema_id(_tablet_schema->id())
+                                    .set_slot_descriptors(&_slot_pointers)
+                                    .set_partial_update_mode(PartialUpdateMode::COLUMN_UPDATE_MODE)
+                                    .build();
+        CHECK_OK(delta_writer.status());
+        CHECK_OK((*delta_writer)->open());
+        for (int shift = 0; shift < kSourceSegments; shift++) {
+            auto chunk = generate_data(kChunkSize, shift, true, update_ratio);
+            CHECK_OK((*delta_writer)->write(chunk, indexes.data(), indexes.size()));
+        }
+        CHECK_OK((*delta_writer)->finish_with_txnlog());
+        (*delta_writer)->close();
+        return txn_id;
+    };
+
+    // Batched: three writes of c1, one publish.
+    std::vector<int64_t> txn_ids = {write_column_update(5), write_column_update(7), write_column_update(9)};
+    ASSIGN_OR_ABORT(auto metadata, batch_publish(tablet_id, version, version + 3, txn_ids));
+    version += 3;
+    ASSERT_EQ(kChunkSize * kSourceSegments,
+              check(version, [](int c0, int c1, int c2) { return (c0 * 9 == c1) && (c0 * 4 == c2); }));
+    ASSERT_EQ(kSourceSegments, metadata->dcg_meta().dcgs_size());
+    for (const auto& [rssid, dcg] : metadata->dcg_meta().dcgs()) {
+        // one .cols per source segment for the whole batch, not one per write
+        EXPECT_EQ(1, dcg.column_files_size()) << rssid;
+    }
+    // every write's update files are orphaned, nothing else (no .cols was ever replaced)
+    EXPECT_EQ(txn_ids.size(), metadata->orphan_files_size());
+
+    // One by one (the old behaviour) gives the same data.
+    bool old_batch_apply = config::lake_pk_column_mode_batch_apply;
+    config::lake_pk_column_mode_batch_apply = false;
+    DeferOp restore([old_batch_apply] { config::lake_pk_column_mode_batch_apply = old_batch_apply; });
+    std::vector<int64_t> txn_ids2 = {write_column_update(11), write_column_update(13)};
+    ASSIGN_OR_ABORT(auto metadata2, batch_publish(tablet_id, version, version + 2, txn_ids2));
+    version += 2;
+    ASSERT_EQ(kChunkSize * kSourceSegments,
+              check(version, [](int c0, int c1, int c2) { return (c0 * 13 == c1) && (c0 * 4 == c2); }));
+    for (const auto& [rssid, dcg] : metadata2->dcg_meta().dcgs()) {
+        EXPECT_EQ(1, dcg.column_files_size()) << rssid;
+    }
+    EXPECT_TRUE(_update_mgr->update_state_mem_tracker()->consumption() == 0);
+}
+
 // Many update files, each touching rows of every source segment. The update files' columns are read
 // once per column batch and shared by all source segments; the result must be the same as reading
 // them for every source segment, with and without memory to keep them.

@@ -39,7 +39,25 @@ public:
 
     Status execute(const RowsetUpdateStateParams& params, MetaFileBuilder* builder);
 
+    // Apply several consecutive column-mode writes of one tablet in one pass, one handler per write,
+    // in commit order. Every source segment is read once per column batch and gets one .cols file
+    // with the final value of every column any of the writes touched, instead of one read and one
+    // .cols per write. A batch publish only materializes its last version, so only the final state
+    // has to exist.
+    static Status execute_batch(const std::vector<ColumnModePartialUpdateHandler*>& handlers,
+                                const std::vector<const RowsetUpdateStateParams*>& params_list,
+                                MetaFileBuilder* builder);
+
 private:
+    // What one write updates, resolved against the current tablet schema.
+    struct Prepared {
+        std::vector<ColumnId> update_column_ids;
+        std::vector<ColumnUID> unique_update_column_ids;
+        // rssid -> update file id -> <source rowid, update rowid>
+        std::map<uint32_t, UptidToRowidPairs> rss_upt_id_to_rowid_pairs;
+        size_t partial_update_states_size = 0;
+    };
+    Status _prepare(const RowsetUpdateStateParams& params, Prepared* prepared);
     Status _load_update_state(const RowsetUpdateStateParams& params);
     void _release_upserts(uint32_t start_idx, uint32_t end_idx);
     Status _load_upserts(const RowsetUpdateStateParams& params, const Schema& pkey_schema,

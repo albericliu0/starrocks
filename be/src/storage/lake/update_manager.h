@@ -94,6 +94,12 @@ public:
                                               const TabletMetadataPtr& metadata, Tablet* tablet,
                                               MetaFileBuilder* builder, int64_t base_version);
 
+    // Apply several consecutive column-mode writes (op_write, txn_id) of one batch publish together,
+    // see ColumnModePartialUpdateHandler::execute_batch.
+    Status publish_column_mode_partial_update(const std::vector<std::pair<TxnLogPB_OpWrite, int64_t>>& writes,
+                                              const TabletMetadataPtr& metadata, Tablet* tablet,
+                                              MetaFileBuilder* builder, int64_t base_version);
+
     // get rowids from primary index by each upserts
     Status get_rowids_from_pkindex(int64_t tablet_id, int64_t base_version,
                                    const std::vector<MutableColumnPtr>& upserts,

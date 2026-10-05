@@ -49,6 +49,15 @@ This topic introduces the following types of BE configurations:
 - Description: Controls the minimum time gap between successive stack-trace diagnostics performed by DiagnoseDaemon for `STACK_TRACE` requests. When a diagnose request arrives, the daemon skips collecting and logging stack traces if the last collection happened less than `diagnose_stack_trace_interval_ms` milliseconds ago. Increase this value to reduce CPU overhead and log volume from frequent stack dumps; decrease it to capture more frequent traces to debug transient issues (for example, in load fail-point simulations of long `TabletsChannel::add_chunk` blocking).
 - Introduced in: v3.5.0
 
+### lake_pk_column_mode_batch_apply
+
+- Default: true
+- Type: Boolean
+- Unit: -
+- Is mutable: Yes
+- Description: Whether the consecutive column-mode partial updates (`partial_update_mode = "column"`) of one shared-data batch publish are applied together. When enabled, every source segment is read once and gets one `.cols` file carrying the final value of every column the updates touched; when disabled, each update reads and rewrites the segments it touches on its own, which costs one read and one `.cols` per update and leaves one delta column group layer per update until compaction folds them. Only the final version of the batch is materialized either way.
+- Introduced in: v3.5.22
+
 ### lake_publish_version_run_expired_tasks
 
 - Default: true

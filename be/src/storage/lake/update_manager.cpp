@@ -370,21 +370,36 @@ Status UpdateManager::publish_primary_key_tablet(const TxnLogPB_OpWrite& op_writ
 Status UpdateManager::publish_column_mode_partial_update(const TxnLogPB_OpWrite& op_write, int64_t txn_id,
                                                          const TabletMetadataPtr& metadata, Tablet* tablet,
                                                          MetaFileBuilder* builder, int64_t base_version) {
+    std::vector<std::pair<TxnLogPB_OpWrite, int64_t>> writes;
+    writes.emplace_back(op_write, txn_id);
+    return publish_column_mode_partial_update(writes, metadata, tablet, builder, base_version);
+}
+
+Status UpdateManager::publish_column_mode_partial_update(
+        const std::vector<std::pair<TxnLogPB_OpWrite, int64_t>>& writes, const TabletMetadataPtr& metadata,
+        Tablet* tablet, MetaFileBuilder* builder, int64_t base_version) {
+    RETURN_ERROR_IF_FALSE(!writes.empty());
     auto tablet_schema = std::make_shared<TabletSchema>(metadata->schema());
     RssidFileInfoContainer rssid_fileinfo_container;
     rssid_fileinfo_container.add_rssid_to_file(*metadata);
 
-    RowsetUpdateStateParams params{
-            .op_write = op_write,
-            .tablet_schema = tablet_schema,
-            .metadata = metadata,
-            .tablet = tablet,
-            .container = rssid_fileinfo_container,
-    };
-
-    ColumnModePartialUpdateHandler handler(base_version, txn_id, _update_mem_tracker);
-    RETURN_IF_ERROR(handler.execute(params, builder));
-    return Status::OK();
+    std::vector<std::unique_ptr<RowsetUpdateStateParams>> params_list;
+    std::vector<std::unique_ptr<ColumnModePartialUpdateHandler>> handlers;
+    std::vector<const RowsetUpdateStateParams*> params_ptrs;
+    std::vector<ColumnModePartialUpdateHandler*> handler_ptrs;
+    for (const auto& [op_write, txn_id] : writes) {
+        params_list.push_back(std::make_unique<RowsetUpdateStateParams>(RowsetUpdateStateParams{
+                .op_write = op_write,
+                .tablet_schema = tablet_schema,
+                .metadata = metadata,
+                .tablet = tablet,
+                .container = rssid_fileinfo_container,
+        }));
+        handlers.push_back(std::make_unique<ColumnModePartialUpdateHandler>(base_version, txn_id, _update_mem_tracker));
+        params_ptrs.push_back(params_list.back().get());
+        handler_ptrs.push_back(handlers.back().get());
+    }
+    return ColumnModePartialUpdateHandler::execute_batch(handler_ptrs, params_ptrs, builder);
 }
 
 Status UpdateManager::_do_update(uint32_t rowset_id, int32_t upsert_idx, const SegmentPKEncodeResultPtr& upsert,

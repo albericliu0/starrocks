@@ -14,6 +14,10 @@
 
 #include "storage/lake/column_mode_partial_update_handler.h"
 
+#include <algorithm>
+#include <set>
+#include <unordered_set>
+
 #include "common/tracer.h"
 #include "fs/fs_util.h"
 #include "fs/key_cache.h"
@@ -426,8 +430,7 @@ static void padding_char_columns(const Schema& schema, const TabletSchemaCSPtr& 
     ChunkHelper::padding_char_columns(char_field_indexes, schema, tschema, chunk);
 }
 
-Status ColumnModePartialUpdateHandler::execute(const RowsetUpdateStateParams& params, MetaFileBuilder* builder) {
-    TRACE_COUNTER_SCOPE_LATENCY_US("pcu_execute_us");
+Status ColumnModePartialUpdateHandler::_prepare(const RowsetUpdateStateParams& params, Prepared* prepared) {
     // 1. load update state first
     RETURN_IF_ERROR(_load_update_state(params));
 
@@ -436,8 +439,6 @@ Status ColumnModePartialUpdateHandler::execute(const RowsetUpdateStateParams& pa
     // cid may shift across schema versions; recompute it from uid against the current
     // tablet schema. partial_update_column_ids in txn_meta is kept for compatibility only.
     DCHECK_EQ(txn_meta.partial_update_column_ids_size(), txn_meta.partial_update_column_unique_ids_size());
-    std::vector<ColumnId> update_column_ids;
-    std::vector<ColumnUID> unique_update_column_ids;
     for (int i = 0; i < txn_meta.partial_update_column_unique_ids_size(); ++i) {
         const uint32_t uid = txn_meta.partial_update_column_unique_ids(i);
         const auto cid = params.tablet_schema->field_index(uid);
@@ -451,8 +452,8 @@ Status ColumnModePartialUpdateHandler::execute(const RowsetUpdateStateParams& pa
         if (col.is_key() || col.is_auto_increment()) {
             continue;
         }
-        update_column_ids.push_back(cid);
-        unique_update_column_ids.push_back(uid);
+        prepared->update_column_ids.push_back(cid);
+        prepared->unique_update_column_ids.push_back(uid);
 
         if (cid != static_cast<ColumnId>(txn_meta.partial_update_column_ids(i))) {
             LOG(INFO) << "lake pcu schema drift detected: tablet=" << params.tablet->tablet_id() << " uid=" << uid
@@ -461,29 +462,73 @@ Status ColumnModePartialUpdateHandler::execute(const RowsetUpdateStateParams& pa
         }
     }
 
-    const size_t BATCH_HANDLE_COLUMN_CNT = config::vertical_compaction_max_columns_per_group;
-
-    // 2. getter all rss_rowid_to_update_rowid, and prepare .col writer by the way
+    // 2. getter all rss_rowid_to_update_rowid
     // rss_id -> update file id -> <rowid, update rowid>
-    std::map<uint32_t, UptidToRowidPairs> rss_upt_id_to_rowid_pairs;
     for (int upt_id = 0; upt_id < _partial_update_states.size(); upt_id++) {
         for (const auto& each_rss : _partial_update_states[upt_id].rss_rowid_to_update_rowid) {
             for (const auto& each : each_rss.second) {
-                rss_upt_id_to_rowid_pairs[each_rss.first][upt_id].emplace_back(each.first, each.second);
+                prepared->rss_upt_id_to_rowid_pairs[each_rss.first][upt_id].emplace_back(each.first, each.second);
             }
             TRACE_COUNTER_INCREMENT("pcu_update_cnt", each_rss.second.size());
         }
         TRACE_COUNTER_INCREMENT("pcu_insert_rows", _partial_update_states[upt_id].insert_rowids.size());
     }
-
-    const size_t partial_update_states_size = _partial_update_states.size();
+    prepared->partial_update_states_size = _partial_update_states.size();
     _partial_update_states.clear();
+    return Status::OK();
+}
+
+Status ColumnModePartialUpdateHandler::execute(const RowsetUpdateStateParams& params, MetaFileBuilder* builder) {
+    return execute_batch({this}, {&params}, builder);
+}
+
+Status ColumnModePartialUpdateHandler::execute_batch(const std::vector<ColumnModePartialUpdateHandler*>& handlers,
+                                                     const std::vector<const RowsetUpdateStateParams*>& params_list,
+                                                     MetaFileBuilder* builder) {
+    TRACE_COUNTER_SCOPE_LATENCY_US("pcu_execute_us");
+    RETURN_ERROR_IF_FALSE(!handlers.empty() && handlers.size() == params_list.size());
+    const size_t num_writes = handlers.size();
+    std::vector<Prepared> prepared(num_writes);
+    for (size_t i = 0; i < num_writes; i++) {
+        RETURN_IF_ERROR(handlers[i]->_prepare(*params_list[i], &prepared[i]));
+    }
+    // tablet, schema and metadata are the same for every write of the batch
+    const RowsetUpdateStateParams& tablet_params = *params_list[0];
+    MemTracker* tracker = handlers[0]->_tracker;
+
+    // The union of the columns the writes update, in first-seen order. One .cols per source segment
+    // and column batch carries the final value of all of them.
+    std::vector<ColumnId> update_column_ids;
+    std::vector<ColumnUID> unique_update_column_ids;
+    {
+        std::unordered_set<ColumnUID> seen;
+        for (const auto& p : prepared) {
+            for (size_t j = 0; j < p.unique_update_column_ids.size(); j++) {
+                if (seen.insert(p.unique_update_column_ids[j]).second) {
+                    update_column_ids.push_back(p.update_column_ids[j]);
+                    unique_update_column_ids.push_back(p.unique_update_column_ids[j]);
+                }
+            }
+        }
+    }
+
+    const size_t BATCH_HANDLE_COLUMN_CNT = config::vertical_compaction_max_columns_per_group;
+
     // must record unique column id in delta column group
     // dcg_column_ids and dcg_column_files are mapped one to the other. E.g.
     // {{1,2}, {3,4}} -> {"aaa.cols", "bbb.cols"}
     // It means column_1 and column_2 are stored in aaa.cols, and column_3 and column_4 are stored in bbb.cols
     std::map<uint32_t, std::vector<std::vector<ColumnUID>>> dcg_column_ids;
     std::map<uint32_t, std::vector<std::pair<std::string, std::string>>> dcg_column_file_with_encryption_metas;
+
+    // One write's share of a column batch: which of the batch's columns it updates and where they sit.
+    struct WriteSlice {
+        ColumnModePartialUpdateHandler* handler;
+        const Prepared* prepared;
+        std::vector<size_t> positions;
+        Schema schema;
+    };
+
     // 3. read from raw segment file and update file, and generate `.col` files one by one
     for (uint32_t col_index = 0; col_index < update_column_ids.size(); col_index += BATCH_HANDLE_COLUMN_CNT) {
         // 3.1 build column id range
@@ -492,46 +537,97 @@ Status ColumnModePartialUpdateHandler::execute(const RowsetUpdateStateParams& pa
         std::vector<ColumnUID> selective_unique_update_column_ids =
                 append_fixed_batch(unique_update_column_ids, col_index, BATCH_HANDLE_COLUMN_CNT);
         // 3.2 build partial schema and iterators
-        auto partial_tschema = TabletSchema::create_with_uid(params.tablet_schema, selective_unique_update_column_ids);
-        Schema partial_schema = ChunkHelper::convert_schema(params.tablet_schema, selective_update_column_ids);
-        // The update files are read once per column batch and shared by all source segments below.
-        RETURN_IF_ERROR(_prepare_upt_chunk_cache(partial_schema));
-        DeferOp release_cache([&]() { _release_upt_chunk_cache(); });
-        for (const auto& each : rss_upt_id_to_rowid_pairs) {
-            // 3.3 read from source segment
-            ASSIGN_OR_RETURN(auto source_chunk_ptr, _read_from_source_segment(params, partial_schema, each.first));
+        auto partial_tschema =
+                TabletSchema::create_with_uid(tablet_params.tablet_schema, selective_unique_update_column_ids);
+        Schema partial_schema = ChunkHelper::convert_schema(tablet_params.tablet_schema, selective_update_column_ids);
+
+        std::vector<WriteSlice> slices;
+        for (size_t i = 0; i < num_writes; i++) {
+            WriteSlice slice{handlers[i], &prepared[i], {}, Schema()};
+            std::vector<ColumnId> cids;
+            const auto& uids = prepared[i].unique_update_column_ids;
+            for (size_t pos = 0; pos < selective_unique_update_column_ids.size(); pos++) {
+                if (std::find(uids.begin(), uids.end(), selective_unique_update_column_ids[pos]) != uids.end()) {
+                    slice.positions.push_back(pos);
+                    cids.push_back(selective_update_column_ids[pos]);
+                }
+            }
+            if (slice.positions.empty()) {
+                continue;
+            }
+            slice.schema = ChunkHelper::convert_schema(tablet_params.tablet_schema, cids);
+            // The update files are read once per column batch and shared by all source segments below.
+            RETURN_IF_ERROR(handlers[i]->_prepare_upt_chunk_cache(slice.schema));
+            slices.push_back(std::move(slice));
+        }
+        DeferOp release_caches([&]() {
+            for (auto& slice : slices) {
+                slice.handler->_release_upt_chunk_cache();
+            }
+        });
+        // every source segment any write of this batch touches
+        std::set<uint32_t> rssids;
+        for (const auto& slice : slices) {
+            for (const auto& each : slice.prepared->rss_upt_id_to_rowid_pairs) {
+                rssids.insert(each.first);
+            }
+        }
+
+        for (uint32_t rssid : rssids) {
+            // 3.3 read from source segment, once for all writes
+            ASSIGN_OR_RETURN(auto source_chunk_ptr,
+                             handlers[0]->_read_from_source_segment(tablet_params, partial_schema, rssid));
             const size_t source_chunk_size = source_chunk_ptr->memory_usage();
-            _tracker->consume(source_chunk_size);
-            DeferOp tracker_defer([&]() { _tracker->release(source_chunk_size); });
-            // 3.2 read from update segment
-            RETURN_IF_ERROR(_update_source_chunk_by_upt(each.second, partial_schema, &source_chunk_ptr));
+            tracker->consume(source_chunk_size);
+            DeferOp tracker_defer([&]() { tracker->release(source_chunk_size); });
+            // 3.4 apply the writes in commit order, so a later write wins on a row they both update
+            for (auto& slice : slices) {
+                auto it = slice.prepared->rss_upt_id_to_rowid_pairs.find(rssid);
+                if (it == slice.prepared->rss_upt_id_to_rowid_pairs.end()) {
+                    continue;
+                }
+                // A view of the source chunk restricted to this write's columns. It shares the column
+                // objects, so updating the view updates the source chunk in place.
+                Columns columns;
+                for (size_t pos : slice.positions) {
+                    columns.push_back(source_chunk_ptr->get_column_by_index(pos));
+                }
+                ChunkPtr view = std::make_shared<Chunk>(std::move(columns), std::make_shared<Schema>(slice.schema));
+                RETURN_IF_ERROR(slice.handler->_update_source_chunk_by_upt(it->second, slice.schema, &view));
+            }
             uint64_t segment_file_size = 0;
             uint64_t index_size = 0;
             uint64_t footer_position = 0;
             padding_char_columns(partial_schema, partial_tschema, source_chunk_ptr.get());
+            // 3.5 write one .cols for the batch, named after its last write
             ASSIGN_OR_RETURN(auto delta_column_group_writer,
-                             _prepare_delta_column_group_writer(params, partial_tschema));
+                             handlers.back()->_prepare_delta_column_group_writer(tablet_params, partial_tschema));
             {
                 TRACE_COUNTER_SCOPE_LATENCY_US("pcu_finalize_dcg_us");
                 RETURN_IF_ERROR(delta_column_group_writer->append_chunk(*source_chunk_ptr));
                 RETURN_IF_ERROR(delta_column_group_writer->finalize(&segment_file_size, &index_size, &footer_position));
             }
             // 3.6 prepare column id list and dcg file list
-            dcg_column_ids[each.first].push_back(selective_unique_update_column_ids);
-            dcg_column_file_with_encryption_metas[each.first].emplace_back(
+            dcg_column_ids[rssid].push_back(selective_unique_update_column_ids);
+            dcg_column_file_with_encryption_metas[rssid].emplace_back(
                     file_name(delta_column_group_writer->segment_path()), delta_column_group_writer->encryption_meta());
             TRACE_COUNTER_INCREMENT("pcu_handle_cnt", 1);
         }
     }
     // 4 generate delta columngroup
-    for (const auto& each : rss_upt_id_to_rowid_pairs) {
-        builder->append_dcg(each.first, dcg_column_file_with_encryption_metas[each.first], dcg_column_ids[each.first]);
+    for (const auto& each : dcg_column_ids) {
+        builder->append_dcg(each.first, dcg_column_file_with_encryption_metas[each.first], each.second);
     }
-    builder->apply_column_mode_partial_update(params.op_write);
+    size_t upt_cnt = 0;
+    for (size_t i = 0; i < num_writes; i++) {
+        builder->apply_column_mode_partial_update(params_list[i]->op_write);
+        upt_cnt += prepared[i].partial_update_states_size;
+    }
 
-    TRACE_COUNTER_INCREMENT("pcu_rss_cnt", rss_upt_id_to_rowid_pairs.size());
-    TRACE_COUNTER_INCREMENT("pcu_upt_cnt", partial_update_states_size);
+    TRACE_COUNTER_INCREMENT("pcu_rss_cnt", dcg_column_ids.size());
+    TRACE_COUNTER_INCREMENT("pcu_upt_cnt", upt_cnt);
     TRACE_COUNTER_INCREMENT("pcu_column_cnt", update_column_ids.size());
+    TRACE_COUNTER_INCREMENT("pcu_merged_write_cnt", num_writes);
     return Status::OK();
 }
 

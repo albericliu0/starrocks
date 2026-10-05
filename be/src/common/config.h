@@ -1200,6 +1200,11 @@ CONF_mBool(lake_enable_publish_version_trace_log, "false");
 // wasted its queue slot and put the tablet at the back of the queue again on every retry. Run the
 // task anyway. Set to false to restore the old behaviour.
 CONF_mBool(lake_publish_version_run_expired_tasks, "true");
+// Apply the consecutive column-mode partial updates of one batch publish together: each source
+// segment is read once and gets one .cols file carrying the final value of every column the
+// writes touched, instead of one read and one .cols per write. Set to false to apply them one by
+// one as before.
+CONF_mBool(lake_pk_column_mode_batch_apply, "true");
 CONF_mString(lake_vacuum_retry_pattern, "*request rate*");
 CONF_mInt64(lake_vacuum_retry_max_attempts, "5");
 CONF_mInt64(lake_vacuum_retry_min_delay_ms, "100");

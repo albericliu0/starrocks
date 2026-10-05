@@ -49,6 +49,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 説明: DiagnoseDaemon が `STACK_TRACE` リクエストに対して行う連続したスタックトレース診断の最小時間間隔を制御します。診断リクエストが到着したとき、最後の収集が `diagnose_stack_trace_interval_ms` ミリ秒未満であれば、デーモンはスタックトレースの収集およびログ出力をスキップします。頻繁なスタックダンプによる CPU 負荷やログ量を減らすためにこの値を大きくし、短期間の問題をデバッグするためにより頻繁なトレースを取得したい場合（例えば TabletsChannel::add_chunk が長時間ブロックするロードのフェイルポイントシミュレーションなど）には値を小さくしてください。
 - 導入バージョン: v3.5.0
 
+### lake_pk_column_mode_batch_apply
+
+- デフォルト: true
+- タイプ: Boolean
+- 単位: -
+- 変更可能: Yes
+- 説明: 共有データクラスタのバッチ publish において、同一バッチ内で連続する列モード部分更新（`partial_update_mode = "column"`）をまとめて適用するかどうか。有効にすると各ソースセグメントは一度だけ読み込まれ、更新対象列の最終値を持つ `.cols` ファイルが一つだけ書き出されます。無効にすると更新ごとにセグメントを読み直して書き直すため、更新ごとに一回の読み込みと一つの `.cols` が必要になり、compaction で畳まれるまで更新ごとに delta column group の層が残ります。いずれの場合もバッチの最終バージョンのみが物化されます。
+- 導入バージョン: v3.5.22
+
 ### lake_publish_version_run_expired_tasks
 
 - デフォルト: true

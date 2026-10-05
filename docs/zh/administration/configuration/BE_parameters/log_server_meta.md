@@ -46,6 +46,15 @@ SELECT * FROM information_schema.be_configs [WHERE NAME LIKE "%<name_pattern>%"]
 - 描述：DiagnoseDaemon 处理 `STACK_TRACE` 请求时，两次堆栈诊断的最小时间间隔。若距离上次采集不足该间隔则跳过，以减少频繁堆栈抓取的 CPU 和日志开销；排查瞬时问题可适当调小。
 - 引入版本：v3.5.0
 
+### lake_pk_column_mode_batch_apply
+
+- 默认值：true
+- 类型：Boolean
+- 单位：-
+- 是否动态：是
+- 描述：存算分离集群批量 publish 时，同一批里连续的列模式部分更新（`partial_update_mode = "column"`）是否合并应用。开启后每个源 segment 只回读一次，并只写出一个带有各被更新列最终值的 `.cols` 文件；关闭后每个更新各自回读、重写它碰到的 segment，代价是每个更新一次回读加一个 `.cols`，并在 compaction 合并前为每个更新留下一层 delta column group。两种方式都只物化该批次的最终版本。
+- 引入版本：v3.5.22
+
 ### lake_publish_version_run_expired_tasks
 
 - 默认值：true

@@ -152,6 +152,11 @@ public:
                 config::enable_pk_strict_memcheck ? _tablet.update_mgr()->mem_tracker() : nullptr);
         _max_txn_id = std::max(_max_txn_id, log.txn_id());
         RETURN_IF_ERROR(check_rebuild_index());
+        // Anything that is not another column-mode write has to see the column updates buffered so
+        // far applied first.
+        if (!(log.has_op_write() && is_column_mode_partial_update(log.op_write()))) {
+            RETURN_IF_ERROR(check_and_recover([&]() { return flush_column_mode_writes_with_lock(); }));
+        }
         if (log.has_op_write()) {
             RETURN_IF_ERROR(check_and_recover([&]() { return apply_write_log(log.op_write(), log.txn_id()); }));
         }
@@ -176,6 +181,7 @@ public:
         SCOPED_THREAD_LOCAL_CHECK_MEM_LIMIT_SETTER(true);
         SCOPED_THREAD_LOCAL_SINGLETON_CHECK_MEM_TRACKER_SETTER(
                 config::enable_pk_strict_memcheck ? _tablet.update_mgr()->mem_tracker() : nullptr);
+        RETURN_IF_ERROR(check_and_recover([&]() { return flush_column_mode_writes_with_lock(); }));
         // local persistent index will update index version, so we need to load first
         // still need prepre primary index even there is an empty compaction
         if (_index_entry == nullptr &&
@@ -258,12 +264,41 @@ private:
         }
         RETURN_IF_ERROR(prepare_primary_index());
         if (is_column_mode_partial_update(op_write)) {
-            return _tablet.update_mgr()->publish_column_mode_partial_update(op_write, txn_id, _metadata, &_tablet,
-                                                                            &_builder, _base_version);
+            // Consecutive column-mode writes of one batch publish are applied together: every source
+            // segment is then read and rewritten once for all of them instead of once per write.
+            _pending_column_mode_writes.emplace_back(op_write, txn_id);
+            if (!config::lake_pk_column_mode_batch_apply) {
+                return flush_column_mode_writes();
+            }
+            return Status::OK();
         } else {
+            // a row-mode write must see the column updates before it
+            RETURN_IF_ERROR(flush_column_mode_writes());
             return _tablet.update_mgr()->publish_primary_key_tablet(op_write, txn_id, _metadata, &_tablet, _index_entry,
                                                                     &_builder, _base_version);
         }
+    }
+
+    // Applies the buffered column-mode writes. The caller holds the pk index shard lock.
+    Status flush_column_mode_writes() {
+        if (_pending_column_mode_writes.empty()) {
+            return Status::OK();
+        }
+        RETURN_IF_ERROR(prepare_primary_index());
+        RETURN_IF_ERROR(_tablet.update_mgr()->publish_column_mode_partial_update(_pending_column_mode_writes, _metadata,
+                                                                                 &_tablet, &_builder, _base_version));
+        _pending_column_mode_writes.clear();
+        return Status::OK();
+    }
+
+    Status flush_column_mode_writes_with_lock() {
+        if (_pending_column_mode_writes.empty()) {
+            return Status::OK();
+        }
+        // get lock to avoid gc
+        _tablet.update_mgr()->lock_shard_pk_index_shard(_tablet.id());
+        DeferOp defer([&]() { _tablet.update_mgr()->unlock_shard_pk_index_shard(_tablet.id()); });
+        return flush_column_mode_writes();
     }
 
     Status apply_compaction_log(const TxnLogPB_OpCompaction& op_compaction, int64_t txn_id) {
@@ -419,6 +454,8 @@ private:
     int64_t _base_version{0};
     int64_t _new_version{0};
     int64_t _max_txn_id{0}; // Used as the file name prefix of the delvec file
+    // column-mode writes of this batch not applied yet, in commit order
+    std::vector<std::pair<TxnLogPB_OpWrite, int64_t>> _pending_column_mode_writes;
     MetaFileBuilder _builder;
     DynamicCache<uint64_t, LakePrimaryIndex>::Entry* _index_entry{nullptr};
     std::unique_ptr<std::lock_guard<std::shared_timed_mutex>> _guard{nullptr};
