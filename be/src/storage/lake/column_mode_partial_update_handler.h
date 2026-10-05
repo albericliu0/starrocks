@@ -50,6 +50,17 @@ private:
             const RowsetUpdateStateParams& params, const std::shared_ptr<TabletSchema>& tschema);
     Status _update_source_chunk_by_upt(const UptidToRowidPairs& upt_id_to_rowid_pairs, const Schema& partial_schema,
                                        ChunkPtr* source_chunk);
+
+    // The update files' columns for the column batch being processed, read once and kept until the
+    // batch is done. One update file usually carries rows of nearly every source segment (keys are
+    // hash distributed), and the source segments are processed one at a time, so without this every
+    // source segment re-read every update file it touched: O(source segments x update files) reads of
+    // the same data. That was most of a column-mode publish's time on wide tables.
+    Status _prepare_upt_chunk_cache(const Schema& partial_schema);
+    void _release_upt_chunk_cache();
+    // The chunk of update file `upt_id`. `*cached` tells whether it is kept in the cache (the caller
+    // must not release its memory) or was read just for this call (the caller releases it).
+    StatusOr<ChunkPtr> _get_upt_chunk(uint32_t upt_id, const Schema& partial_schema, bool* cached);
     StatusOr<ChunkPtr> _read_from_source_segment(const RowsetUpdateStateParams& params, const Schema& schema,
                                                  uint32_t rssid);
 
@@ -69,6 +80,17 @@ private:
     // `_rowset_meta_ptr` contains full life cycle rowset meta in `_rowset_ptr`.
     RowsetMetadataUniquePtr _rowset_meta_ptr;
     std::unique_ptr<Rowset> _rowset_ptr;
+
+    struct UptChunkCache {
+        // One iterator per update file, consumed by the first read of that file.
+        std::vector<ChunkIteratorPtr> iters;
+        // Indexed by update file id; nullptr until read, or when memory did not allow keeping it.
+        std::vector<ChunkPtr> chunks;
+        int64_t bytes = 0;
+    };
+    UptChunkCache _upt_cache;
+    // Must outlive the iterators in `_upt_cache`.
+    OlapReaderStatistics _upt_stats;
 };
 
 class CompactionUpdateConflictChecker {

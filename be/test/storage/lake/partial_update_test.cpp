@@ -752,6 +752,85 @@ TEST_P(LakePartialUpdateTest, test_write_multi_segment) {
     }
 }
 
+// Many update files, each touching rows of every source segment. The update files' columns are read
+// once per column batch and shared by all source segments; the result must be the same as reading
+// them for every source segment, with and without memory to keep them.
+TEST_P(LakePartialUpdateTest, test_column_mode_many_update_files) {
+    if (GetParam().partial_update_mode != PartialUpdateMode::COLUMN_UPDATE_MODE) {
+        return;
+    }
+    auto indexes = std::vector<uint32_t>(kChunkSize);
+    for (int i = 0; i < kChunkSize; i++) {
+        indexes[i] = i;
+    }
+    auto version = 1;
+    auto tablet_id = _tablet_metadata->id();
+    // Four source segments with distinct key ranges.
+    const int kSourceSegments = 4;
+    for (int shift = 0; shift < kSourceSegments; shift++) {
+        auto chunk = generate_data(kChunkSize, shift, false, 3);
+        auto txn_id = next_id();
+        ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                                   .set_tablet_manager(_tablet_mgr.get())
+                                                   .set_tablet_id(tablet_id)
+                                                   .set_txn_id(txn_id)
+                                                   .set_partition_id(_partition_id)
+                                                   .set_mem_tracker(_mem_tracker.get())
+                                                   .set_schema_id(_tablet_schema->id())
+                                                   .build());
+        ASSERT_OK(delta_writer->open());
+        ASSERT_OK(delta_writer->write(chunk, indexes.data(), indexes.size()));
+        ASSERT_OK(delta_writer->finish_with_txnlog());
+        delta_writer->close();
+        ASSERT_OK(publish_single_version(tablet_id, version + 1, txn_id).status());
+        version++;
+    }
+    ASSERT_EQ(kChunkSize * kSourceSegments,
+              check(version, [](int c0, int c1, int c2) { return (c0 * 3 == c1) && (c0 * 4 == c2); }));
+
+    auto run_update = [&](int update_ratio) {
+        // One column-mode update that rewrites c1 of every row, split into one update file per
+        // source segment so that every source segment is touched by several update files.
+        const int64_t old_size = config::write_buffer_size;
+        config::write_buffer_size = 1;
+        DeferOp restore([old_size] { config::write_buffer_size = old_size; });
+        auto txn_id = next_id();
+        ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                                   .set_tablet_manager(_tablet_mgr.get())
+                                                   .set_tablet_id(tablet_id)
+                                                   .set_txn_id(txn_id)
+                                                   .set_partition_id(_partition_id)
+                                                   .set_mem_tracker(_mem_tracker.get())
+                                                   .set_schema_id(_tablet_schema->id())
+                                                   .set_slot_descriptors(&_slot_pointers)
+                                                   .set_partial_update_mode(PartialUpdateMode::COLUMN_UPDATE_MODE)
+                                                   .build());
+        ASSERT_OK(delta_writer->open());
+        for (int shift = 0; shift < kSourceSegments; shift++) {
+            auto chunk = generate_data(kChunkSize, shift, true, update_ratio);
+            ASSERT_OK(delta_writer->write(chunk, indexes.data(), indexes.size()));
+        }
+        ASSERT_OK(delta_writer->finish_with_txnlog());
+        delta_writer->close();
+        ASSERT_OK(publish_single_version(tablet_id, version + 1, txn_id).status());
+        version++;
+        ASSERT_EQ(kChunkSize * kSourceSegments, check(version, [update_ratio](int c0, int c1, int c2) {
+                      return (c0 * update_ratio == c1) && (c0 * 4 == c2);
+                  }));
+    };
+
+    // With memory to keep the update files.
+    run_update(5);
+    // Without: the tracker is over its limit, so every read is dropped after use and the next source
+    // segment reads the file again.
+    MemTracker* tracker = _update_mgr->mem_tracker();
+    const int64_t old_limit = tracker->limit();
+    tracker->set_limit(1);
+    DeferOp restore_limit([tracker, old_limit] { tracker->set_limit(old_limit); });
+    run_update(7);
+    EXPECT_TRUE(_update_mgr->update_state_mem_tracker()->consumption() == 0);
+}
+
 TEST_P(LakePartialUpdateTest, test_write_multi_segment_by_diff_val) {
     auto chunk0 = generate_data(kChunkSize, 0, false, 3);
     auto chunk1 = generate_data(kChunkSize, 0, true, 5);
