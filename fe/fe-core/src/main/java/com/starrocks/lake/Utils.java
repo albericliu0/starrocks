@@ -14,6 +14,7 @@
 
 package com.starrocks.lake;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Lists;
 import com.staros.proto.ShardInfo;
 import com.starrocks.catalog.MaterializedIndex;
@@ -34,15 +35,19 @@ import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.WarehouseManager;
 import com.starrocks.system.ComputeNode;
 import com.starrocks.system.SystemInfoService;
+import com.starrocks.thrift.TStatusCode;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.concurrent.Future;
 import javax.validation.constraints.NotNull;
 
@@ -160,23 +165,74 @@ public class Utils {
             nodeList.add(node);
         }
 
+        // Collect every node's answer before deciding the outcome. A node that answered for all of its
+        // tablets has done its work, and so has a node that answered for most of them: the compute node
+        // persists each published tablet's metadata on its own. Giving up at the first failed tablet, as
+        // this used to, made the next attempt resend the whole partition and every node re-answer for
+        // tablets it had already published.
+        Set<Long> failedTabletIds = new HashSet<>();
+        boolean allInProgress = true;
+        String firstError = null;
+        String firstErrorHost = null;
         for (int i = 0; i < responseList.size(); i++) {
+            ComputeNode node = nodeList.get(i);
+            PublishVersionResponse response;
             try {
-                PublishVersionResponse response = responseList.get(i).get();
-                if (response != null && response.failedTablets != null && !response.failedTablets.isEmpty()) {
-                    throw new RpcException("Fail to publish version for tablets " + response.failedTablets + ": " +
-                            response.status.errorMsgs.get(0));
-                }
-                if (compactionScores != null && response != null && response.compactionScores != null) {
-                    compactionScores.putAll(response.compactionScores);
-                }
-                if (baseVersion == 1 && tabletRowNum != null && response != null && response.tabletRowNums != null) {
-                    tabletRowNum.putAll(response.tabletRowNums);
-                }
+                response = responseList.get(i).get();
             } catch (Exception e) {
-                throw new RpcException(nodeList.get(i).getHost(), e.getMessage());
+                // The RPC itself failed, so nothing on this node is known to have published.
+                failedTabletIds.addAll(nodeToTablets.get(node));
+                allInProgress = false;
+                if (firstError == null) {
+                    firstError = e.getMessage();
+                    firstErrorHost = node.getHost();
+                }
+                continue;
+            }
+            List<Long> nodeFailed = (response != null && response.failedTablets != null)
+                    ? response.failedTablets : Collections.emptyList();
+            if (!nodeFailed.isEmpty()) {
+                failedTabletIds.addAll(nodeFailed);
+                Integer code = response.status == null ? null : response.status.statusCode;
+                if (!isPublishInProgressStatus(code)) {
+                    allInProgress = false;
+                }
+                if (firstError == null) {
+                    firstError = (response.status != null && response.status.errorMsgs != null
+                            && !response.status.errorMsgs.isEmpty()) ? response.status.errorMsgs.get(0) : "unknown";
+                    firstErrorHost = node.getHost();
+                }
+            }
+            // Everything below is keyed by tablet id and only describes tablets the node did publish.
+            if (compactionScores != null && response != null && response.compactionScores != null) {
+                compactionScores.putAll(response.compactionScores);
+            }
+            if (baseVersion == 1 && tabletRowNum != null && response != null && response.tabletRowNums != null) {
+                tabletRowNum.putAll(response.tabletRowNums);
             }
         }
+        if (!failedTabletIds.isEmpty()) {
+            // Leave the caller a routing map that only names published tablets, so what it keeps for the
+            // next attempt (the txn logs to delete once the batch finishes) is exact.
+            for (List<Long> tabletIds : nodeToTablets.values()) {
+                tabletIds.removeIf(failedTabletIds::contains);
+            }
+            nodeToTablets.values().removeIf(List::isEmpty);
+            throw new PublishVersionPartialFailureException(firstErrorHost, failedTabletIds, allInProgress,
+                    "Fail to publish version for tablets " + failedTabletIds + ": " + firstError);
+        }
+    }
+
+    // RESOURCE_BUSY: the node is still running an earlier publish of this tablet. TIMEOUT and
+    // PUBLISH_TIMEOUT: the task did not fit in the deadline. All three mean "not yet", not "broken",
+    // so the caller waits and asks again instead of reporting an error.
+    @VisibleForTesting
+    static boolean isPublishInProgressStatus(Integer statusCode) {
+        if (statusCode == null) {
+            return false;
+        }
+        TStatusCode code = TStatusCode.findByValue(statusCode);
+        return code == TStatusCode.RESOURCE_BUSY || code == TStatusCode.TIMEOUT || code == TStatusCode.PUBLISH_TIMEOUT;
     }
 
     public static void publishVersion(@NotNull List<Tablet> tablets, TxnInfoPB txnInfo, long baseVersion,

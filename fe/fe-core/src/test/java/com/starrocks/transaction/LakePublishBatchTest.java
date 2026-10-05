@@ -16,6 +16,7 @@
 package com.starrocks.transaction;
 
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
 import com.starrocks.alter.AlterJobV2;
 import com.starrocks.alter.LakeTableSchemaChangeJob;
 import com.starrocks.catalog.Database;
@@ -31,6 +32,7 @@ import com.starrocks.common.FeConstants;
 import com.starrocks.common.NoAliveBackendException;
 import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.lake.LakeTablet;
+import com.starrocks.lake.PublishVersionPartialFailureException;
 import com.starrocks.lake.Utils;
 import com.starrocks.proto.PublishLogVersionBatchRequest;
 import com.starrocks.proto.TxnInfoPB;
@@ -58,10 +60,14 @@ import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 
 import java.util.Collection;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.validation.constraints.NotNull;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
@@ -845,5 +851,65 @@ public class LakePublishBatchTest {
             }
         }
         awaitPublish(daemon, waiter1, waiter2);
+    }
+
+    @Test
+    public void testPartialFailureRetriesOnlyPendingTablets() throws Exception {
+        long savedRetryInterval = Config.lake_publish_version_retry_interval_ms;
+        Config.lake_publish_version_retry_interval_ms = 0;
+        Set<Long> busyOnce = Collections.synchronizedSet(new HashSet<>());
+        AtomicInteger retries = new AtomicInteger();
+        AtomicInteger badRetries = new AtomicInteger();
+        new MockUp<Utils>() {
+            @Mock
+            public void publishVersionBatch(List<Tablet> tablets, List<TxnInfoPB> txnInfos, long baseVersion,
+                                                   long newVersion, Map<Long, Double> compactionScores,
+                                                   Map<ComputeNode, List<Long>> nodeToTablets, long warehouseId,
+                                                   Map<Long, Long> tabletRowNum) throws RpcException {
+                boolean isRetry = tablets.stream().anyMatch(t -> busyOnce.contains(t.getId()));
+                if (!isRetry) {
+                    // First attempt for this partition: the node owning the first tablet is still
+                    // applying an earlier request for it, everything else publishes.
+                    long busy = tablets.get(0).getId();
+                    busyOnce.add(busy);
+                    throw new PublishVersionPartialFailureException("cn-1", Sets.newHashSet(busy), true,
+                            "Fail to publish version for tablets [" + busy
+                                    + "]: The previous publish version task for tablet " + busy
+                                    + " has not finished");
+                }
+                retries.incrementAndGet();
+                // The retry must carry only the tablet that was not published.
+                if (tablets.size() != 1 || !busyOnce.contains(tablets.get(0).getId())) {
+                    badRetries.incrementAndGet();
+                }
+            }
+        };
+        try {
+            Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDb(DB);
+            Table table = GlobalStateMgr.getCurrentState().getLocalMetastore().getTable(db.getFullName(), TABLE);
+            List<TabletCommitInfo> transTablets1 = Lists.newArrayList();
+            List<TabletCommitInfo> transTablets2 = Lists.newArrayList();
+            generateSimpleTabletCommitInfo(db, table, transTablets1, transTablets2);
+
+            GlobalTransactionMgr globalTransactionMgr = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr();
+            long txnId1 = globalTransactionMgr.beginTransaction(db.getId(), Lists.newArrayList(table.getId()),
+                    "partial_retry_1_" + UUIDUtil.genUUID(), transactionSource,
+                    TransactionState.LoadJobSourceType.FRONTEND, Config.stream_load_default_timeout_second);
+            VisibleStateWaiter waiter1 = globalTransactionMgr.commitTransaction(db.getId(), txnId1, transTablets1,
+                    Lists.newArrayList(), null);
+            long txnId2 = globalTransactionMgr.beginTransaction(db.getId(), Lists.newArrayList(table.getId()),
+                    "partial_retry_2_" + UUIDUtil.genUUID(), transactionSource,
+                    TransactionState.LoadJobSourceType.FRONTEND, Config.stream_load_default_timeout_second);
+            VisibleStateWaiter waiter2 = globalTransactionMgr.commitTransaction(db.getId(), txnId2, transTablets2,
+                    Lists.newArrayList(), null);
+
+            PublishVersionDaemon daemon = new PublishVersionDaemon();
+            awaitPublish(daemon, waiter1, waiter2);
+
+            Assertions.assertTrue(retries.get() > 0, "every partition should have been retried once");
+            Assertions.assertEquals(0, badRetries.get(), "a retry must resend only the tablets that did not publish");
+        } finally {
+            Config.lake_publish_version_retry_interval_ms = savedRetryInterval;
+        }
     }
 }

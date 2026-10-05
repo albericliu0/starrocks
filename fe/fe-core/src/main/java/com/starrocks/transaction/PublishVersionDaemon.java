@@ -49,10 +49,13 @@ import com.starrocks.common.ThreadPoolManager;
 import com.starrocks.common.util.FrontendDaemon;
 import com.starrocks.common.util.concurrent.lock.LockType;
 import com.starrocks.common.util.concurrent.lock.Locker;
+import com.starrocks.lake.PartialPublishProgress;
 import com.starrocks.lake.PartitionPublishVersionData;
+import com.starrocks.lake.PublishVersionPartialFailureException;
 import com.starrocks.lake.TxnInfoHelper;
 import com.starrocks.lake.Utils;
 import com.starrocks.lake.compaction.Quantiles;
+import com.starrocks.metric.MetricRepo;
 import com.starrocks.proto.DeleteTxnLogRequest;
 import com.starrocks.proto.DeleteTxnLogResponse;
 import com.starrocks.proto.TxnInfoPB;
@@ -418,6 +421,8 @@ public class PublishVersionDaemon extends FrontendDaemon {
     }
 
     void publishVersionForLakeTableBatch(List<TransactionStateBatch> readyTransactionStatesBatch) {
+        MetricRepo.GAUGE_LAKE_PUBLISH_PARTITIONS_BACKING_OFF.setValue(
+                countPartitionsBackingOff(readyTransactionStatesBatch, System.currentTimeMillis()));
         Set<Long> publishingLakeTransactionsBatchTableId = getPublishingLakeTransactionsBatchTableId();
         Set<Long> publishingTransactions = getPublishingLakeTransactions();
         for (TransactionStateBatch txnStateBatch : readyTransactionStatesBatch) {
@@ -639,20 +644,42 @@ public class PublishVersionDaemon extends FrontendDaemon {
 
                 // used to delete txnLog when publish success
                 Map<ComputeNode, List<Long>> nodeToTablets = new HashMap<>();
-                Utils.publishVersionBatch(publishTablets, txnInfos,
-                        startVersion - 1, endVersion, compactionScores, nodeToTablets,
-                        warehouseId, null);
+                // An earlier attempt at this same version range may have published part of the
+                // partition. Send only what is still pending and carry the rest forward: the compute
+                // nodes already persisted the published tablets' metadata, and re-asking for them is
+                // what turned one busy tablet into a full-partition retry storm.
+                List<PartitionCommitInfo> commitInfos = publishVersionData.getPartitionCommitInfos();
+                PartialPublishProgress progress =
+                        PartialPublishProgress.find(commitInfos, startVersion - 1, endVersion);
+                if (progress != null) {
+                    publishTablets = progress.pendingTablets(publishTablets);
+                    progress.restoreInto(compactionScores, nodeToTablets);
+                    LOG.info("Resume publish of partition {} versions {}-{}: {} tablets already published, {} pending",
+                            partitionId, startVersion, endVersion, progress.getPublishedTabletIds().size(),
+                            publishTablets.size());
+                }
+                try {
+                    if (!publishTablets.isEmpty()) {
+                        Utils.publishVersionBatch(publishTablets, txnInfos,
+                                startVersion - 1, endVersion, compactionScores, nodeToTablets,
+                                warehouseId, null);
+                    }
+                } catch (PublishVersionPartialFailureException e) {
+                    if (progress == null) {
+                        progress = new PartialPublishProgress(startVersion - 1, endVersion);
+                    }
+                    progress.recordAttempt(publishTablets, e.getFailedTabletIds(), compactionScores, nodeToTablets);
+                    PartialPublishProgress.attach(commitInfos, progress);
+                    return partialPublishFailed(partitionId, transactionStates, commitInfos, txnInfos, e);
+                }
+                PartialPublishProgress.clear(commitInfos);
 
                 Quantiles quantiles = Quantiles.compute(compactionScores.values());
                 stateBatch.setCompactionScore(tableId, partitionId, quantiles);
                 stateBatch.putBeTablets(partitionId, nodeToTablets);
             }
         } catch (Exception e) {
-            for (int i = 0; i < transactionStates.size(); i++) {
-                TransactionState txnState = transactionStates.get(i);
-                // Avoid holding txn write lock here; setting errMsg is best-effort for diagnostics
-                txnState.setErrorMsg("Fail to publish partition " + partitionId + " error " + e.getMessage());
-            }
+            markPublishError(transactionStates, partitionId, e.getMessage());
             List<PartitionCommitInfo> commitInfos = publishVersionData.getPartitionCommitInfos();
             if (commitInfos.isEmpty() || commitInfos.get(0)
                     .shouldLogPublishError(System.currentTimeMillis(), PUBLISH_ERROR_LOG_INTERVAL_MS)) {
@@ -663,6 +690,39 @@ public class PublishVersionDaemon extends FrontendDaemon {
         }
 
         return BatchPublishResult.SUCCESS;
+    }
+
+    // Avoid holding the txn write lock here; setting errMsg is best-effort for diagnostics.
+    private static void markPublishError(List<TransactionState> transactionStates, long partitionId, String message) {
+        for (TransactionState txnState : transactionStates) {
+            txnState.setErrorMsg("Fail to publish partition " + partitionId + " error " + message);
+        }
+    }
+
+    // Some tablets of the partition did not publish this round. What did publish is already recorded
+    // on the batch's commit infos by the caller; this only accounts for and reports the rest, then
+    // lets the retry interval pace the next attempt.
+    private BatchPublishResult partialPublishFailed(long partitionId, List<TransactionState> transactionStates,
+                                                    List<PartitionCommitInfo> commitInfos, List<TxnInfoPB> txnInfos,
+                                                    PublishVersionPartialFailureException e) {
+        markPublishError(transactionStates, partitionId, e.getMessage());
+        MetricRepo.COUNTER_LAKE_PUBLISH_PARTITION_RETRY.increase(1L);
+        boolean shouldLog = commitInfos.isEmpty() || commitInfos.get(0)
+                .shouldLogPublishError(System.currentTimeMillis(), PUBLISH_ERROR_LOG_INTERVAL_MS);
+        List<Long> txnIds = txnInfos.stream().map(i -> i.txnId).collect(Collectors.toList());
+        if (e.isInProgress()) {
+            // The compute nodes are still applying an earlier request for these tablets, or the task
+            // did not fit in the deadline. That is a wait, not a failure: say so briefly and without a
+            // stack trace.
+            MetricRepo.COUNTER_LAKE_PUBLISH_TABLET_IN_PROGRESS.increase((long) e.getFailedTabletIds().size());
+            if (shouldLog) {
+                LOG.warn("Publish of partition {} of txnIds {} is still in progress on the compute nodes, " +
+                        "{} tablets pending: {}", partitionId, txnIds, e.getFailedTabletIds().size(), e.getMessage());
+            }
+        } else if (shouldLog) {
+            LOG.error("Fail to publish partition {} of txnIds {}:", partitionId, txnIds, e);
+        }
+        return BatchPublishResult.FAILED;
     }
 
     private void deleteTxnLogIgnoreError(ComputeNode node, DeleteTxnLogRequest request) {
@@ -903,6 +963,28 @@ public class PublishVersionDaemon extends FrontendDaemon {
         for (PartitionCommitInfo commitInfo : commitInfos) {
             commitInfo.markPublishFailed(now);
         }
+    }
+
+    // How many distinct partitions of the ready batches are waiting out the back-off that follows a
+    // failed publish attempt. Exposed as a gauge so a cluster stuck in the "deadline -> retry" loop
+    // shows up on a dashboard instead of only in fe.log.
+    @VisibleForTesting
+    static long countPartitionsBackingOff(List<TransactionStateBatch> batches, long now) {
+        Set<Long> backingOff = new HashSet<>();
+        for (TransactionStateBatch batch : batches) {
+            for (TransactionState state : batch.getTransactionStates()) {
+                for (TableCommitInfo tableCommitInfo : state.getIdToTableCommitInfos().values()) {
+                    for (Map.Entry<Long, PartitionCommitInfo> entry :
+                            tableCommitInfo.getIdToPartitionCommitInfo().entrySet()) {
+                        long failedAt = entry.getValue().getLastPublishFailureTime();
+                        if (failedAt > 0 && now < failedAt + publishRetryIntervalMs()) {
+                            backingOff.add(entry.getKey());
+                        }
+                    }
+                }
+            }
+        }
+        return backingOff.size();
     }
 
     // True while the partition is inside the back-off window that follows a failed publish
