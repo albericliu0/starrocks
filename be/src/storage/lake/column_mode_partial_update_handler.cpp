@@ -374,6 +374,7 @@ StatusOr<ChunkPtr> ColumnModePartialUpdateHandler::_get_upt_chunk(uint32_t upt_i
     OlapReaderStatistics stats;
     ASSIGN_OR_RETURN(auto segment_iters, _rowset_ptr->get_each_segment_iterator(partial_schema, true, &stats));
     RETURN_ERROR_IF_FALSE(segment_iters.size() == _rowset_ptr->num_segments());
+    TEST_SYNC_POINT_CALLBACK("ColumnModePartialUpdateHandler::_get_upt_chunk:iters_built", &upt_id);
     DeferOp close_iters([&]() {
         for (auto& iter : segment_iters) {
             if (iter != nullptr) {
@@ -394,6 +395,7 @@ StatusOr<ChunkPtr> ColumnModePartialUpdateHandler::_get_upt_chunk(uint32_t upt_i
     // append_selective() reads its offsets.
     RETURN_IF_ERROR(ChunkHelper::reject_if_over_capacity(*upt_chunk, "column mode partial update upt file chunk",
                                                          _rowset_ptr->tablet_id(), _txn_id));
+    TEST_SYNC_POINT_CALLBACK("ColumnModePartialUpdateHandler::_get_upt_chunk:chunk_read", &upt_id);
     const int64_t bytes = upt_chunk->memory_usage();
     _tracker->consume(bytes);
     if (entry != nullptr) {

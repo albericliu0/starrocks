@@ -16,13 +16,17 @@
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
+#include <iostream>
 #include <map>
 #include <mutex>
 #include <random>
 #include <set>
+#include <thread>
 
 #include "base/testutil/assert.h"
 #include "base/testutil/id_generator.h"
+#include "base/debug/trace.h"
 #include "base/testutil/sync_point.h"
 #include "base/utility/defer_op.h"
 #include "column/array_column.h"
@@ -483,6 +487,179 @@ TEST_P(LakePartialUpdateTest, test_column_mode_many_update_files) {
     EXPECT_EQ(update_files, static_cast<int>(upt_ids.size()));
     EXPECT_EQ(kSourceSegments * update_files, reads.load());
     EXPECT_EQ(0, _update_mgr->update_state_mem_tracker()->consumption());
+}
+
+// Benchmark for the update-file cache: S source segments of kRows rows, one column-mode update
+// written as U update files whose keys are strided across every source segment. Publishes once with
+// the cache and once with keeping forced off (the pre-cache behaviour), and prints the publish time
+// and the apply counters of both. Output lines start with BENCH.
+TEST_P(LakePartialUpdateTest, bench_column_mode_update_file_reads) {
+    if (GetParam().partial_update_mode != PartialUpdateMode::COLUMN_UPDATE_MODE) {
+        GTEST_SKIP() << "Only column mode reads update files while generating DCGs";
+    }
+    const int kRows = 2048;
+    const int kUpdateFiles = 4;
+    const std::vector<int> segment_counts = {1, 16, 64, 256};
+    auto version = 1;
+    const auto tablet_id = _tablet_metadata->id();
+
+    using Clock = std::chrono::steady_clock;
+    std::atomic<int> reads{0};
+    std::atomic<int64_t> build_us{0};
+    std::atomic<int64_t> read_us{0};
+    std::mutex phase_mu;
+    std::map<std::thread::id, Clock::time_point> read_start;
+    std::map<std::thread::id, Clock::time_point> built_at;
+    Clock::time_point apply_start;
+    Clock::time_point last_emit;
+    bool keep_in_cache = true;
+    auto us_since = [](Clock::time_point t) {
+        return std::chrono::duration_cast<std::chrono::microseconds>(Clock::now() - t).count();
+    };
+    SyncPoint::GetInstance()->SetCallBack("ColumnModePartialUpdateHandler::_calc_upt_memory_usage_per_row",
+                                          [&](void*) { apply_start = Clock::now(); });
+    SyncPoint::GetInstance()->SetCallBack("ColumnModePartialUpdateHandler::_read_from_source_segment_and_update:emit",
+                                          [&](void*) {
+                                              std::lock_guard<std::mutex> l(phase_mu);
+                                              last_emit = Clock::now();
+                                          });
+    SyncPoint::GetInstance()->SetCallBack("ColumnModePartialUpdateHandler::_get_upt_chunk:read", [&](void*) {
+        reads++;
+        std::lock_guard<std::mutex> l(phase_mu);
+        read_start[std::this_thread::get_id()] = Clock::now();
+    });
+    SyncPoint::GetInstance()->SetCallBack("ColumnModePartialUpdateHandler::_get_upt_chunk:iters_built",
+                                          [&](void*) {
+                                              std::lock_guard<std::mutex> l(phase_mu);
+                                              build_us += us_since(read_start[std::this_thread::get_id()]);
+                                              built_at[std::this_thread::get_id()] = Clock::now();
+                                          });
+    SyncPoint::GetInstance()->SetCallBack("ColumnModePartialUpdateHandler::_get_upt_chunk:chunk_read",
+                                          [&](void*) {
+                                              std::lock_guard<std::mutex> l(phase_mu);
+                                              read_us += us_since(built_at[std::this_thread::get_id()]);
+                                          });
+    SyncPoint::GetInstance()->SetCallBack("ColumnModePartialUpdateHandler::_get_upt_chunk:keep",
+                                          [&](void* arg) { *static_cast<bool*>(arg) = keep_in_cache; });
+    SyncPoint::GetInstance()->EnableProcessing();
+    DeferOp sync_point_guard([&]() {
+        for (const char* name : {"ColumnModePartialUpdateHandler::_calc_upt_memory_usage_per_row",
+                                 "ColumnModePartialUpdateHandler::_read_from_source_segment_and_update:emit",
+                                 "ColumnModePartialUpdateHandler::_get_upt_chunk:read",
+                                 "ColumnModePartialUpdateHandler::_get_upt_chunk:iters_built",
+                                 "ColumnModePartialUpdateHandler::_get_upt_chunk:chunk_read",
+                                 "ColumnModePartialUpdateHandler::_get_upt_chunk:keep"}) {
+            SyncPoint::GetInstance()->ClearCallBack(name);
+        }
+        SyncPoint::GetInstance()->DisableProcessing();
+    });
+
+    auto make_chunk = [&](const std::vector<int>& keys, int ratio, bool full) {
+        std::vector<int> v1(keys.size());
+        for (size_t i = 0; i < keys.size(); i++) {
+            v1[i] = keys[i] * ratio;
+        }
+        auto c0 = Int32Column::create();
+        auto c1 = Int32Column::create();
+        c0->append_numbers(keys.data(), keys.size() * sizeof(int));
+        c1->append_numbers(v1.data(), v1.size() * sizeof(int));
+        if (!full) {
+            return Chunk({std::move(c0), std::move(c1)}, _slot_cid_map);
+        }
+        std::vector<int> v2(keys.size());
+        for (size_t i = 0; i < keys.size(); i++) {
+            v2[i] = keys[i] * 4;
+        }
+        auto c2 = Int32Column::create();
+        c2->append_numbers(v2.data(), v2.size() * sizeof(int));
+        return Chunk({std::move(c0), std::move(c1), std::move(c2)}, _slot_cid_map);
+    };
+    auto write_and_publish = [&](Chunk& chunk, bool column_mode) {
+        const auto txn_id = next_id();
+        DeltaWriterBuilder builder;
+        builder.set_tablet_manager(_tablet_mgr.get())
+                .set_tablet_id(tablet_id)
+                .set_txn_id(txn_id)
+                .set_partition_id(_partition_id)
+                .set_mem_tracker(_mem_tracker.get())
+                .set_schema_id(_tablet_schema->id());
+        if (column_mode) {
+            builder.set_slot_descriptors(&_slot_pointers).set_partial_update_mode(PartialUpdateMode::COLUMN_UPDATE_MODE);
+        }
+        ASSIGN_OR_ABORT(auto delta_writer, builder.build());
+        ASSERT_OK(delta_writer->open());
+        std::vector<uint32_t> indexes(chunk.num_rows());
+        std::iota(indexes.begin(), indexes.end(), 0);
+        ASSERT_OK(delta_writer->write(chunk, indexes.data(), indexes.size()));
+        ASSERT_OK(delta_writer->finish_with_txnlog());
+        delta_writer->close();
+        ASSERT_OK(publish_single_version(tablet_id, ++version, txn_id).status());
+    };
+
+    int key_base = 0;
+    for (int segments : segment_counts) {
+        // S source segments with contiguous key ranges, one publish each.
+        for (int seg = 0; seg < segments; seg++) {
+            std::vector<int> keys(kRows);
+            std::iota(keys.begin(), keys.end(), key_base + seg * kRows);
+            auto chunk = make_chunk(keys, 3, true);
+            write_and_publish(chunk, false);
+        }
+        const int total = segments * kRows;
+        for (int pass = 0; pass < 2; pass++) {
+            keep_in_cache = (pass == 0);
+            const int ratio = 5 + pass;
+            reads = 0;
+            build_us = 0;
+            read_us = 0;
+            // One column-mode update: U update files, file f holds keys base + f, base + f + U, ...
+            ConfigResetGuard<int64_t> write_buffer_guard(&config::write_buffer_size, 1);
+            const auto txn_id = next_id();
+            ASSIGN_OR_ABORT(auto delta_writer, DeltaWriterBuilder()
+                                                       .set_tablet_manager(_tablet_mgr.get())
+                                                       .set_tablet_id(tablet_id)
+                                                       .set_txn_id(txn_id)
+                                                       .set_partition_id(_partition_id)
+                                                       .set_mem_tracker(_mem_tracker.get())
+                                                       .set_schema_id(_tablet_schema->id())
+                                                       .set_slot_descriptors(&_slot_pointers)
+                                                       .set_partial_update_mode(PartialUpdateMode::COLUMN_UPDATE_MODE)
+                                                       .build());
+            ASSERT_OK(delta_writer->open());
+            for (int f = 0; f < kUpdateFiles; f++) {
+                std::vector<int> keys;
+                keys.reserve(total / kUpdateFiles + 1);
+                for (int k = f; k < total; k += kUpdateFiles) {
+                    keys.push_back(key_base + k);
+                }
+                auto chunk = make_chunk(keys, ratio, false);
+                std::vector<uint32_t> indexes(chunk.num_rows());
+                std::iota(indexes.begin(), indexes.end(), 0);
+                ASSERT_OK(delta_writer->write(chunk, indexes.data(), indexes.size()));
+            }
+            ASSERT_OK(delta_writer->finish_with_txnlog());
+            delta_writer->close();
+
+            const auto start = Clock::now();
+            apply_start = start;
+            last_emit = start;
+            ASSERT_OK(publish_single_version(tablet_id, ++version, txn_id).status());
+            const auto end = Clock::now();
+            auto ms = [](Clock::time_point a, Clock::time_point b) {
+                return std::chrono::duration_cast<std::chrono::milliseconds>(b - a).count();
+            };
+            std::cout << "BENCH segments=" << segments << " rows_per_segment=" << kRows
+                      << " update_files=" << kUpdateFiles << " mode=" << (keep_in_cache ? "cache" : "nocache")
+                      << " publish_ms=" << ms(start, end) << " before_apply_ms=" << ms(start, apply_start)
+                      << " apply_to_last_emit_ms=" << ms(apply_start, last_emit)
+                      << " after_last_emit_ms=" << ms(last_emit, end) << " upt_reads=" << reads.load()
+                      << " upt_iter_build_ms=" << build_us.load() / 1000 << " upt_file_read_ms=" << read_us.load() / 1000
+                      << std::endl;
+        }
+        key_base += total;
+    }
+    // Every key of the last config carries its last update.
+    EXPECT_EQ(key_base, check(version, [](int c0, int c1, int c2) { return c0 * 4 == c2; }));
 }
 
 TEST_P(LakePartialUpdateTest, test_bundled_orphan_segment_marked_shared) {
